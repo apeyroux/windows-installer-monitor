@@ -21,6 +21,7 @@ python windows_installer_monitor.py run-and-snapshot --installer "C:\\path\\to\\
 
 """
 import argparse
+import fnmatch
 import hashlib
 import json
 import os
@@ -45,11 +46,12 @@ def ensure_windows():
 
 # ---------- Filesystem snapshot helpers ----------
 
-def snapshot_files(paths, follow_links=False, path_pattern=None):
+def snapshot_files(paths, follow_links=False, path_pattern=None, extensions=None):
     """Return a dict mapping relative path -> {size, mtime} for given root paths.
     Note: for big trees this can be slow. Caller may choose narrower paths.
     """
     normalized_pattern = path_pattern.lower() if path_pattern else None
+    normalized_exts = [ext.lower() for ext in extensions] if extensions else None
     out = {}
     for root in paths:
         if not os.path.exists(root):
@@ -57,7 +59,10 @@ def snapshot_files(paths, follow_links=False, path_pattern=None):
         for dirpath, dirnames, filenames in os.walk(root, followlinks=follow_links):
             for fname in filenames:
                 full = os.path.join(dirpath, fname)
-                if normalized_pattern and normalized_pattern not in full.lower():
+                full_lower = full.lower()
+                if normalized_pattern and normalized_pattern not in full_lower:
+                    continue
+                if normalized_exts and not any(fnmatch.fnmatch(full_lower, pattern) for pattern in normalized_exts):
                     continue
                 try:
                     st = os.stat(full)
@@ -70,6 +75,26 @@ def snapshot_files(paths, follow_links=False, path_pattern=None):
                     # skip files we can't stat (permissions, locked files)
                     continue
     return out
+
+
+def normalize_extension_patterns(value):
+    if not value:
+        return None
+    if isinstance(value, str):
+        raw = value.split(',')
+    else:
+        raw = []
+        for item in value:
+            raw.extend(item.split(','))
+    patterns = []
+    for item in raw:
+        pattern = item.strip()
+        if not pattern:
+            continue
+        if pattern.startswith('.'):
+            pattern = f'*{pattern}'
+        patterns.append(pattern.lower())
+    return patterns or None
 
 
 def file_sha256(path, chunk_size=1024 * 1024):
@@ -147,11 +172,15 @@ def timestamp():
 # ---------- High-level flows ----------
 
 
-def run_and_snapshot(installer, outdir, paths_to_snapshot=None, wait=5, path_pattern=None):
+def run_and_snapshot(installer, outdir, paths_to_snapshot=None, wait=5, path_pattern=None, extensions=None):
     ensure_windows()
     if paths_to_snapshot is None:
         paths_to_snapshot = DEFAULT_WATCH_PATHS
-    before_files = snapshot_files(paths_to_snapshot, path_pattern=path_pattern)
+    before_files = snapshot_files(
+        paths_to_snapshot,
+        path_pattern=path_pattern,
+        extensions=extensions,
+    )
 
     # run installer
     print('Launching installer:', installer)
@@ -160,7 +189,11 @@ def run_and_snapshot(installer, outdir, paths_to_snapshot=None, wait=5, path_pat
     print('Installer finished, waiting {}s for final writes...'.format(wait))
     time.sleep(wait)
 
-    after_files = snapshot_files(paths_to_snapshot, path_pattern=path_pattern)
+    after_files = snapshot_files(
+        paths_to_snapshot,
+        path_pattern=path_pattern,
+        extensions=extensions,
+    )
 
     added, removed, changed = compare_file_snapshots(before_files, after_files)
     added, removed, changed = sanitize_results(added, removed, changed)
@@ -188,6 +221,7 @@ def main():
     p_run.add_argument('--paths', nargs='*', default=DEFAULT_WATCH_PATHS)
     p_run.add_argument('--wait', type=int, default=5)
     p_run.add_argument('--path-pattern', help='Only include files whose path contains this pattern (case-insensitive)')
+    p_run.add_argument('--extensions', help='Comma-separated glob patterns to include (e.g., "*.exe,*.txt")')
 
     args = parser.parse_args()
 
@@ -199,6 +233,7 @@ def main():
             paths_to_snapshot=args.paths,
             wait=args.wait,
             path_pattern=args.path_pattern,
+            extensions=normalize_extension_patterns(args.extensions),
         )
         return
 

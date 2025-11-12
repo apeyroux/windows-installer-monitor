@@ -5,6 +5,7 @@ Outil en Python pour lancer un installeur Windows (.exe), capturer l’état de 
 ## Fonctionnalités principales
 - **run-and-snapshot** : lance l’installeur, prend deux instantanés des chemins surveillés et produit la liste des fichiers ajoutés/supprimés/modifiés.
 - Filtrage des fichiers sur une sous-chaîne (`--path-pattern`) et calcul automatique du `sha256` pour chaque fichier retenu.
+- Possibilité de limiter aux extensions/globs souhaités (`--extensions "*.exe,*.dll"`).
 
 ## Installation
 ```bash
@@ -20,10 +21,12 @@ python windows_installer_monitor.py run-and-snapshot \
   --installer "C:\Chemin\setup.exe" \
   --out C:\chemin\vers\resultats \
   --paths "C:\Program Files" "C:\Program Files (x86)" "C:\Users" \
-  --path-pattern obsidian
+  --path-pattern obsidian \
+  --extensions "*.exe,*.txt"
 ```
 - `--paths` : racines à explorer (par défaut celles fournies dans `DEFAULT_WATCH_PATHS`).
 - `--path-pattern` : optionnel, conserve uniquement les fichiers dont le chemin contient la chaîne (insensible à la casse). Sans ce filtre, tous les fichiers des chemins surveillés seront listés.
+- `--extensions` : liste de motifs glob séparés par des virgules (ex. `*.exe,*.txt`). Comparaison insensible à la casse ; un motif commençant par `.ext` est interprété comme `*.ext`.
 - Le résultat est un fichier `results_<timestamp>.json` contenant les sections `files.added`, `files.removed` et `files.changed`. Chaque entrée garde uniquement la somme `sha256`.
 
 ## Notes d’utilisation
