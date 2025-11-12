@@ -1,2 +1,1 @@
-psutil
-watchdog
+# No external dependencies required
