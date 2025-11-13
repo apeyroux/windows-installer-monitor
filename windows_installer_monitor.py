@@ -246,7 +246,9 @@ def expand_env_placeholders(path, mappings=None):
 # ---------- Utilities ----------
 
 def save_json(obj, path):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(obj, f, indent=2, ensure_ascii=False)
 
@@ -258,7 +260,7 @@ def timestamp():
 # ---------- High-level flows ----------
 
 
-def run_and_snapshot(installer, outdir, paths_to_snapshot=None, wait=5, path_pattern=None, extensions=None, exclude_extensions=None, env_placeholders=False, verbose=False):
+def run_and_snapshot(installer, outdir, paths_to_snapshot=None, wait=5, path_pattern=None, extensions=None, exclude_extensions=None, env_placeholders=False, verbose=False, out_filename=None):
     ensure_windows()
     if paths_to_snapshot is None:
         paths_to_snapshot = DEFAULT_WATCH_PATHS
@@ -291,11 +293,15 @@ def run_and_snapshot(installer, outdir, paths_to_snapshot=None, wait=5, path_pat
     if env_placeholders:
         added, removed, changed = apply_env_placeholders_to_results(added, removed, changed)
 
+    now_str = timestamp()
     results = {
-        'meta': {'installer': installer, 'timestamp': timestamp()},
+        'meta': {'installer': installer, 'timestamp': now_str},
         'files': {'added': added, 'removed': removed, 'changed': changed},
     }
-    outpath = os.path.join(outdir, f'results_{timestamp()}.json')
+    if out_filename:
+        outpath = out_filename if os.path.isabs(out_filename) else os.path.join(outdir, out_filename)
+    else:
+        outpath = os.path.join(outdir, f'results_{now_str}.json')
     save_json(results, outpath)
     print('Saved results to', outpath)
     return results
@@ -379,6 +385,7 @@ def main():
     p_run = sub.add_parser('run-and-snapshot', help='Run an installer and snapshot around it')
     p_run.add_argument('--installer', required=True)
     p_run.add_argument('--out', required=True)
+    p_run.add_argument('--out-file', help='Custom filename for the JSON report (defaults to results_<timestamp>.json inside --out)')
     p_run.add_argument('--paths', nargs='*', default=DEFAULT_WATCH_PATHS)
     p_run.add_argument('--wait', type=int, default=5)
     p_run.add_argument('--path-pattern', help='Only include files whose path contains this pattern (case-insensitive)')
@@ -405,6 +412,7 @@ def main():
             exclude_extensions=normalize_extension_patterns(args.extensions_exclude),
             env_placeholders=args.env_placeholders,
             verbose=args.verbose,
+            out_filename=args.out_file,
         )
         return
 
