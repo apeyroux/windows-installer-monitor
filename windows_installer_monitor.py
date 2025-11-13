@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
-"""
-windows_installer_monitor.py
+"""Surveillance d'installateur Windows et comparaison d'instantanés.
 
-Single-file utility to run an installer (.exe), capture filesystem state before/after and list what changed.
+Le script se charge d'exécuter un installeur ``.exe`` puis de comparer l'état du
+système de fichiers avant et après l'opération. Il enregistre les différences
+dans un rapport JSON en option.
 
-Fonctionnalités:
-- Exécute automatiquement l’installeur puis compare les chemins surveillés.
-- Filtre optionnel sur un motif (`--path-pattern`) pour ne garder que certains fichiers.
-- Calcule le SHA-256 pour chaque fichier retenu et enregistre le résultat en JSON.
+Fonctionnalités principales
+---------------------------
+* Exécution automatique de l'installeur et capture des chemins surveillés.
+* Filtrage facultatif (`--path-pattern`, `--extensions`, `--extensions-exclude`).
+* Calcul de l'empreinte SHA-256 pour chaque fichier conservé.
 
-Limitations:
-- Needs to be run on Windows with administrator privileges for system-wide paths.
-- Cannot replace Procmon/ETW for low-level kernel/driver operations; this is higher-level and best-effort.
+Limitations
+-----------
+* L'outil doit être exécuté sous Windows avec les privilèges nécessaires.
+* Il ne remplace pas Procmon/ETW pour l'observation bas niveau du noyau.
 
-Dependencies:
-- Un environnement Python 3.8+
-
-Usage:
-python windows_installer_monitor.py run-and-snapshot --installer "C:\\path\\to\\setup.exe" --out results
-
+Utilisation rapide
+------------------
+``python windows_installer_monitor.py run-and-snapshot --installer "C:\\path\\to\\setup.exe" --out results``
 """
 import argparse
 import fnmatch
@@ -29,15 +29,66 @@ import platform
 import subprocess
 import sys
 import time
+from collections.abc import Mapping as MappingABC
 from datetime import datetime, timezone
+from typing import (
+    Any,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    TypedDict,
+    Union,
+    cast,
+)
 
-DEFAULT_WATCH_PATHS = [
+
+class FileMetadata(TypedDict, total=False):
+    """Structure minimale pour décrire un fichier suivi."""
+
+    size: int
+    mtime: float
+    sha256: str
+
+
+class ChangedFileEntry(TypedDict, total=False):
+    """Représente l'état d'un fichier avant et après installation."""
+
+    before: FileMetadata
+    after: FileMetadata
+
+
+# Ces alias rendent les annotations plus lisibles dans les signatures publiques.
+Snapshot = Dict[str, FileMetadata]
+ChangedSnapshot = Dict[str, ChangedFileEntry]
+
+MIN_SUPPORTED_PYTHON: Tuple[int, int] = (3, 10)
+
+
+def ensure_supported_python() -> None:
+    """Vérifie que l'interpréteur courant correspond à la version minimale requise."""
+
+    if sys.version_info < MIN_SUPPORTED_PYTHON:
+        current = '.'.join(str(part) for part in sys.version_info[:3])
+        required = f"{MIN_SUPPORTED_PYTHON[0]}.{MIN_SUPPORTED_PYTHON[1]}"
+        print(
+            'Ce script nécessite Python {required} ou plus récent. '
+            'Version détectée: {current}.'
+            .format(required=required, current=current)
+        )
+        sys.exit(1)
+
+
+DEFAULT_WATCH_PATHS: List[str] = [
     r"C:\Program Files",
     r"C:\Program Files (x86)",
     r"C:\Users",
 ]
 
-ENV_PATH_PLACEHOLDER_VARS = [
+ENV_PATH_PLACEHOLDER_VARS: List[str] = [
     'USERPROFILE',
     'HOMEDRIVE',
     'HOMEPATH',
@@ -51,7 +102,9 @@ ENV_PATH_PLACEHOLDER_VARS = [
 ]
 
 
-def ensure_windows():
+def ensure_windows() -> None:
+    """Interrompt l'exécution si le script n'est pas lancé sur Windows."""
+
     if platform.system() != 'Windows':
         print('This script is intended to run on Windows. Exiting.')
         sys.exit(1)
@@ -59,19 +112,33 @@ def ensure_windows():
 
 # ---------- Filesystem snapshot helpers ----------
 
-def debug_print(enabled, message):
+def debug_print(enabled: bool, message: str) -> None:
+    """Affiche un message de diagnostic lorsque le mode verbeux est activé."""
+
     if enabled:
         print(f'[verbose] {message}')
 
 
-def snapshot_files(paths, follow_links=False, path_pattern=None, extensions=None, exclude_extensions=None, verbose=False):
-    """Return a dict mapping relative path -> {size, mtime} for given root paths.
-    Note: for big trees this can be slow. Caller may choose narrower paths.
+def snapshot_files(
+    paths: Sequence[str],
+    follow_links: bool = False,
+    path_pattern: Optional[str] = None,
+    extensions: Optional[Sequence[str]] = None,
+    exclude_extensions: Optional[Sequence[str]] = None,
+    verbose: bool = False,
+) -> Snapshot:
+    """Représente l'état des fichiers sous plusieurs chemins racines.
+
+    Chaque fichier retenu est indexé par son chemin absolu et associé à un
+    dictionnaire contenant les métadonnées utiles (taille, date de modification
+    et empreinte SHA-256 si possible). Les filtres permettent de limiter le
+    périmètre et d'accélérer le traitement.
     """
+
     normalized_pattern = path_pattern.lower() if path_pattern else None
     normalized_exts = [ext.lower() for ext in extensions] if extensions else None
     normalized_exclude_exts = [ext.lower() for ext in exclude_extensions] if exclude_extensions else None
-    out = {}
+    out: Snapshot = {}
     total_files = 0
     retained_files = 0
     for root in paths:
@@ -92,7 +159,10 @@ def snapshot_files(paths, follow_links=False, path_pattern=None, extensions=None
                     continue
                 try:
                     st = os.stat(full)
-                    meta = {'size': st.st_size, 'mtime': st.st_mtime}
+                    # Les métadonnées minimales sont la taille et la date de
+                    # dernière modification. Elles permettent d'identifier les
+                    # changements même sans hachage.
+                    meta: FileMetadata = {'size': st.st_size, 'mtime': st.st_mtime}
                     sha = file_sha256(full)
                     if sha:
                         meta['sha256'] = sha
@@ -105,16 +175,21 @@ def snapshot_files(paths, follow_links=False, path_pattern=None, extensions=None
     return out
 
 
-def normalize_extension_patterns(value):
+def normalize_extension_patterns(
+    value: Optional[Union[str, Iterable[str]]]
+) -> Optional[List[str]]:
+    """Nettoie et unifie la liste de motifs d'extension fournis en argument."""
+
     if not value:
         return None
     if isinstance(value, str):
         raw = value.split(',')
     else:
-        raw = []
+        raw_list: List[str] = []
         for item in value:
-            raw.extend(item.split(','))
-    patterns = []
+            raw_list.extend(item.split(','))
+        raw = raw_list
+    patterns: List[str] = []
     for item in raw:
         pattern = item.strip()
         if not pattern:
@@ -125,8 +200,8 @@ def normalize_extension_patterns(value):
     return patterns or None
 
 
-def file_sha256(path, chunk_size=1024 * 1024):
-    """Return SHA256 hex digest for path or None if not readable."""
+def file_sha256(path: str, chunk_size: int = 1024 * 1024) -> Optional[str]:
+    """Calcule l'empreinte SHA-256 d'un fichier en limitant l'usage mémoire."""
     try:
         h = hashlib.sha256()
         with open(path, 'rb') as fh:
@@ -137,24 +212,34 @@ def file_sha256(path, chunk_size=1024 * 1024):
         return None
 
 
-def compare_file_snapshots(before, after):
-    added = {}
-    removed = {}
-    changed = {}
+def compare_file_snapshots(
+    before: Mapping[str, FileMetadata],
+    after: Mapping[str, FileMetadata],
+) -> Tuple[Snapshot, Snapshot, ChangedSnapshot]:
+    """Compare deux instantanés et retourne les fichiers ajoutés, supprimés et modifiés."""
+
+    added: Snapshot = {}
+    removed: Snapshot = {}
+    changed: ChangedSnapshot = {}
     for p, meta in after.items():
         if p not in before:
             added[p] = meta
         else:
             b = before[p]
             if files_differ(b, meta):
-                changed[p] = {'before': b, 'after': meta}
+                changed[p] = {
+                    'before': ensure_file_metadata(b),
+                    'after': ensure_file_metadata(meta),
+                }
     for p, meta in before.items():
         if p not in after:
             removed[p] = meta
     return added, removed, changed
 
 
-def files_differ(before_meta, after_meta):
+def files_differ(before_meta: Mapping[str, Any], after_meta: Mapping[str, Any]) -> bool:
+    """Détermine si deux ensembles de métadonnées décrivent un fichier différent."""
+
     if before_meta.get('size') != after_meta.get('size'):
         return True
     if int(before_meta.get('mtime', 0)) != int(after_meta.get('mtime', 0)):
@@ -164,30 +249,53 @@ def files_differ(before_meta, after_meta):
     return False
 
 
-def sanitize_meta(meta):
-    if not isinstance(meta, dict):
-        return meta
-    clean = dict(meta)
-    clean.pop('size', None)
-    clean.pop('mtime', None)
+def sanitize_meta(meta: Mapping[str, Any]) -> FileMetadata:
+    """Supprime les informations volatiles d'un dictionnaire de métadonnées."""
+
+    clean: FileMetadata = {}
+    if not isinstance(meta, MappingABC):
+        return clean
+    if 'sha256' in meta:
+        clean['sha256'] = meta['sha256']
     return clean
 
 
-def sanitize_results(added, removed, changed):
-    clean_added = {p: sanitize_meta(meta) for p, meta in added.items()}
-    clean_removed = {p: sanitize_meta(meta) for p, meta in removed.items()}
-    clean_changed = {}
+def ensure_file_metadata(meta: object) -> FileMetadata:
+    """Garantit un dictionnaire typé même si l'entrée est partielle ou invalide."""
+
+    if isinstance(meta, MappingABC):
+        return cast(FileMetadata, dict(meta))
+    return cast(FileMetadata, {})
+
+
+def sanitize_results(
+    added: Mapping[str, FileMetadata],
+    removed: Mapping[str, FileMetadata],
+    changed: Mapping[str, ChangedFileEntry],
+) -> Tuple[Snapshot, Snapshot, ChangedSnapshot]:
+    """Filtre les métadonnées pour ne conserver que les informations utiles."""
+
+    clean_added: Snapshot = {p: sanitize_meta(meta) for p, meta in added.items()}
+    clean_removed: Snapshot = {p: sanitize_meta(meta) for p, meta in removed.items()}
+    clean_changed: ChangedSnapshot = {}
     for p, payload in changed.items():
+        if isinstance(payload, MappingABC):
+            before_meta = ensure_file_metadata(payload.get('before'))
+            after_meta = ensure_file_metadata(payload.get('after'))
+        else:
+            before_meta = ensure_file_metadata(None)
+            after_meta = ensure_file_metadata(None)
         clean_changed[p] = {
-            'before': sanitize_meta(payload.get('before')),
-            'after': sanitize_meta(payload.get('after')),
+            'before': sanitize_meta(before_meta),
+            'after': sanitize_meta(after_meta),
         }
     return clean_added, clean_removed, clean_changed
 
 
-def build_env_path_mappings():
-    """Return list of (norm_value, raw_value, placeholder) sorted by length."""
-    mappings = []
+def build_env_path_mappings() -> List[Tuple[str, str, str]]:
+    """Construit une liste de couples chemin/placeholder triés par longueur."""
+
+    mappings: List[Tuple[str, str, str]] = []
     seen = set()
     for var in ENV_PATH_PLACEHOLDER_VARS:
         raw_value = os.environ.get(var)
@@ -205,7 +313,11 @@ def build_env_path_mappings():
     return mappings
 
 
-def replace_path_with_env_placeholder(path, mappings=None):
+def replace_path_with_env_placeholder(
+    path: str, mappings: Optional[Sequence[Tuple[str, str, str]]] = None
+) -> str:
+    """Remplace un préfixe de chemin par son placeholder d'environnement."""
+
     if not path:
         return path
     if mappings is None:
@@ -219,16 +331,44 @@ def replace_path_with_env_placeholder(path, mappings=None):
     return normalized
 
 
-def apply_env_placeholders_to_results(added, removed, changed):
+def apply_env_placeholders_to_results(
+    added: Mapping[str, FileMetadata],
+    removed: Mapping[str, FileMetadata],
+    changed: Mapping[str, ChangedFileEntry],
+) -> Tuple[Snapshot, Snapshot, ChangedSnapshot]:
+    """Applique les placeholders d'environnement aux chemins d'un rapport."""
+
     mappings = build_env_path_mappings()
 
-    def remap(mapping):
-        return {replace_path_with_env_placeholder(p, mappings): meta for p, meta in mapping.items()}
+    def remap_snapshot(mapping: Mapping[str, FileMetadata]) -> Snapshot:
+        return {
+            replace_path_with_env_placeholder(p, mappings): ensure_file_metadata(meta)
+            for p, meta in mapping.items()
+        }
 
-    return remap(added), remap(removed), remap(changed)
+    def remap_changed(mapping: Mapping[str, ChangedFileEntry]) -> ChangedSnapshot:
+        remapped: ChangedSnapshot = {}
+        for path, meta in mapping.items():
+            if isinstance(meta, MappingABC):
+                before_meta = ensure_file_metadata(meta.get('before'))
+                after_meta = ensure_file_metadata(meta.get('after'))
+            else:
+                before_meta = ensure_file_metadata(None)
+                after_meta = ensure_file_metadata(None)
+            remapped[replace_path_with_env_placeholder(path, mappings)] = {
+                'before': before_meta,
+                'after': after_meta,
+            }
+        return remapped
+
+    return remap_snapshot(added), remap_snapshot(removed), remap_changed(changed)
 
 
-def expand_env_placeholders(path, mappings=None):
+def expand_env_placeholders(
+    path: str, mappings: Optional[Sequence[Tuple[str, str, str]]] = None
+) -> str:
+    """Remplace un placeholder d'environnement par sa valeur réelle."""
+
     if not path:
         return path
     if mappings is None:
@@ -245,7 +385,9 @@ def expand_env_placeholders(path, mappings=None):
 
 # ---------- Utilities ----------
 
-def save_json(obj, path):
+def save_json(obj: Mapping[str, Any], path: str) -> None:
+    """Enregistre l'objet JSON dans le chemin fourni en créant les dossiers."""
+
     directory = os.path.dirname(path)
     if directory:
         os.makedirs(directory, exist_ok=True)
@@ -253,14 +395,30 @@ def save_json(obj, path):
         json.dump(obj, f, indent=2, ensure_ascii=False)
 
 
-def timestamp():
+def timestamp() -> str:
+    """Retourne un horodatage UTC compact (format YYYYMMDDThhmmssZ)."""
+
     return datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
 
 
 # ---------- High-level flows ----------
 
 
-def run_and_snapshot(installer, outdir, paths_to_snapshot=None, wait=5, path_pattern=None, extensions=None, exclude_extensions=None, env_placeholders=False, verbose=False, out_filename=None):
+def run_and_snapshot(
+    installer: str,
+    outdir: str,
+    paths_to_snapshot: Optional[Sequence[str]] = None,
+    wait: int = 5,
+    path_pattern: Optional[str] = None,
+    extensions: Optional[Sequence[str]] = None,
+    exclude_extensions: Optional[Sequence[str]] = None,
+    env_placeholders: bool = False,
+    verbose: bool = False,
+    out_filename: Optional[str] = None,
+) -> Mapping[str, object]:
+    """Exécute l'installeur et capture l'état du système avant/après."""
+
+    ensure_supported_python()
     ensure_windows()
     if paths_to_snapshot is None:
         paths_to_snapshot = DEFAULT_WATCH_PATHS
@@ -294,7 +452,7 @@ def run_and_snapshot(installer, outdir, paths_to_snapshot=None, wait=5, path_pat
         added, removed, changed = apply_env_placeholders_to_results(added, removed, changed)
 
     now_str = timestamp()
-    results = {
+    results: Dict[str, object] = {
         'meta': {'installer': installer, 'timestamp': now_str},
         'files': {'added': added, 'removed': removed, 'changed': changed},
     }
@@ -307,7 +465,10 @@ def run_and_snapshot(installer, outdir, paths_to_snapshot=None, wait=5, path_pat
     return results
 
 
-def check_report(report_path, verbose=False):
+def check_report(report_path: str, verbose: bool = False) -> int:
+    """Valide un rapport JSON en recalculant les empreintes SHA-256."""
+
+    ensure_supported_python()
     ensure_windows()
     if not os.path.exists(report_path):
         print('Report not found:', report_path)
@@ -379,6 +540,7 @@ def check_report(report_path, verbose=False):
 
 
 def main():
+    ensure_supported_python()
     parser = argparse.ArgumentParser(description='Run an installer and diff filesystem changes (Windows)')
     sub = parser.add_subparsers(dest='cmd')
 
