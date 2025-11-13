@@ -29,12 +29,25 @@ import platform
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 DEFAULT_WATCH_PATHS = [
     r"C:\Program Files",
     r"C:\Program Files (x86)",
-    r"C:\Users", 
+    r"C:\Users",
+]
+
+ENV_PATH_PLACEHOLDER_VARS = [
+    'USERPROFILE',
+    'HOMEDRIVE',
+    'HOMEPATH',
+    'LOCALAPPDATA',
+    'APPDATA',
+    'PROGRAMDATA',
+    'PROGRAMFILES',
+    'PROGRAMFILES(X86)',
+    'COMMONPROGRAMFILES',
+    'COMMONPROGRAMFILES(X86)',
 ]
 
 
@@ -46,21 +59,34 @@ def ensure_windows():
 
 # ---------- Filesystem snapshot helpers ----------
 
-def snapshot_files(paths, follow_links=False, path_pattern=None, extensions=None):
+def debug_print(enabled, message):
+    if enabled:
+        print(f'[verbose] {message}')
+
+
+def snapshot_files(paths, follow_links=False, path_pattern=None, extensions=None, exclude_extensions=None, verbose=False):
     """Return a dict mapping relative path -> {size, mtime} for given root paths.
     Note: for big trees this can be slow. Caller may choose narrower paths.
     """
     normalized_pattern = path_pattern.lower() if path_pattern else None
     normalized_exts = [ext.lower() for ext in extensions] if extensions else None
+    normalized_exclude_exts = [ext.lower() for ext in exclude_extensions] if exclude_extensions else None
     out = {}
+    total_files = 0
+    retained_files = 0
     for root in paths:
         if not os.path.exists(root):
+            debug_print(verbose, f'Skipping missing root: {root}')
             continue
+        debug_print(verbose, f'Scanning root: {root}')
         for dirpath, dirnames, filenames in os.walk(root, followlinks=follow_links):
             for fname in filenames:
                 full = os.path.join(dirpath, fname)
                 full_lower = full.lower()
+                total_files += 1
                 if normalized_pattern and normalized_pattern not in full_lower:
+                    continue
+                if normalized_exclude_exts and any(fnmatch.fnmatch(full_lower, pattern) for pattern in normalized_exclude_exts):
                     continue
                 if normalized_exts and not any(fnmatch.fnmatch(full_lower, pattern) for pattern in normalized_exts):
                     continue
@@ -71,9 +97,11 @@ def snapshot_files(paths, follow_links=False, path_pattern=None, extensions=None
                     if sha:
                         meta['sha256'] = sha
                     out[full] = meta
+                    retained_files += 1
                 except Exception:
                     # skip files we can't stat (permissions, locked files)
                     continue
+    debug_print(verbose, f'Snapshot complete: retained {retained_files} files out of {total_files} inspected')
     return out
 
 
@@ -157,6 +185,49 @@ def sanitize_results(added, removed, changed):
     return clean_added, clean_removed, clean_changed
 
 
+def build_env_path_mappings():
+    """Return list of (norm_value, raw_value, placeholder) sorted by length."""
+    mappings = []
+    seen = set()
+    for var in ENV_PATH_PLACEHOLDER_VARS:
+        raw_value = os.environ.get(var)
+        if not raw_value:
+            continue
+        raw_value = raw_value.replace('/', '\\').rstrip('\\/')
+        if not raw_value:
+            continue
+        norm_value = raw_value.lower()
+        if norm_value in seen:
+            continue
+        seen.add(norm_value)
+        mappings.append((norm_value, raw_value, f'%{var}%'))
+    mappings.sort(key=lambda item: len(item[0]), reverse=True)
+    return mappings
+
+
+def replace_path_with_env_placeholder(path, mappings=None):
+    if not path:
+        return path
+    if mappings is None:
+        mappings = build_env_path_mappings()
+    normalized = path.replace('/', '\\')
+    lowered = normalized.lower()
+    for norm_value, raw_value, placeholder in mappings:
+        if lowered.startswith(norm_value):
+            suffix = normalized[len(raw_value):].lstrip('\\/')
+            return placeholder if not suffix else f'{placeholder}\\{suffix}'
+    return normalized
+
+
+def apply_env_placeholders_to_results(added, removed, changed):
+    mappings = build_env_path_mappings()
+
+    def remap(mapping):
+        return {replace_path_with_env_placeholder(p, mappings): meta for p, meta in mapping.items()}
+
+    return remap(added), remap(removed), remap(changed)
+
+
 # ---------- Utilities ----------
 
 def save_json(obj, path):
@@ -166,13 +237,13 @@ def save_json(obj, path):
 
 
 def timestamp():
-    return datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
+    return datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
 
 
 # ---------- High-level flows ----------
 
 
-def run_and_snapshot(installer, outdir, paths_to_snapshot=None, wait=5, path_pattern=None, extensions=None):
+def run_and_snapshot(installer, outdir, paths_to_snapshot=None, wait=5, path_pattern=None, extensions=None, exclude_extensions=None, env_placeholders=False, verbose=False):
     ensure_windows()
     if paths_to_snapshot is None:
         paths_to_snapshot = DEFAULT_WATCH_PATHS
@@ -180,10 +251,13 @@ def run_and_snapshot(installer, outdir, paths_to_snapshot=None, wait=5, path_pat
         paths_to_snapshot,
         path_pattern=path_pattern,
         extensions=extensions,
+        exclude_extensions=exclude_extensions,
+        verbose=verbose,
     )
 
     # run installer
     print('Launching installer:', installer)
+    debug_print(verbose, f'Watching paths: {paths_to_snapshot}')
     p = subprocess.Popen(installer, shell=False)
     p.wait()
     print('Installer finished, waiting {}s for final writes...'.format(wait))
@@ -193,10 +267,14 @@ def run_and_snapshot(installer, outdir, paths_to_snapshot=None, wait=5, path_pat
         paths_to_snapshot,
         path_pattern=path_pattern,
         extensions=extensions,
+        exclude_extensions=exclude_extensions,
+        verbose=verbose,
     )
 
     added, removed, changed = compare_file_snapshots(before_files, after_files)
     added, removed, changed = sanitize_results(added, removed, changed)
+    if env_placeholders:
+        added, removed, changed = apply_env_placeholders_to_results(added, removed, changed)
 
     results = {
         'meta': {'installer': installer, 'timestamp': timestamp()},
@@ -222,6 +300,9 @@ def main():
     p_run.add_argument('--wait', type=int, default=5)
     p_run.add_argument('--path-pattern', help='Only include files whose path contains this pattern (case-insensitive)')
     p_run.add_argument('--extensions', help='Comma-separated glob patterns to include (e.g., "*.exe,*.txt")')
+    p_run.add_argument('--extensions-exclude', help='Comma-separated glob patterns to exclude (e.g., "*.lnk,*.tmp")')
+    p_run.add_argument('--env-placeholders', action='store_true', help='Replace known path prefixes with %%ENV%% placeholders in the JSON output')
+    p_run.add_argument('--verbose', action='store_true', help='Print detailed progress information')
 
     args = parser.parse_args()
 
@@ -234,6 +315,9 @@ def main():
             wait=args.wait,
             path_pattern=args.path_pattern,
             extensions=normalize_extension_patterns(args.extensions),
+            exclude_extensions=normalize_extension_patterns(args.extensions_exclude),
+            env_placeholders=args.env_placeholders,
+            verbose=args.verbose,
         )
         return
 
